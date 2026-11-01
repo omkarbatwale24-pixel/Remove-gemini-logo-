@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gemini Watermark Remover</title>
+<style>
+body{font-family:system-ui;max-width:640px;margin:20px auto;padding:0 12px;background:#111;color:#eee}
+fieldset{border:1px solid #444;margin:12px 0;padding:12px}
+button,select,input{margin:6px 0}small{color:#aaa}
+canvas,video{max-width:100%;margin-top:8px}
+</style></head><body>
+<h2>Gemini Watermark Remover</h2>
+<select id="kind"><option value="img">Image</option><option value="vid">Video</option></select>
+
+<fieldset><legend>Step 1: Calibration (ek baar)</legend>
+<small>Gemini se pure black image/video banwao, wo yahan do. Corner region (px):</small>
+<input id="reg" type="number" value="320" style="width:70px">
+<input id="cal" type="file" accept="image/*,video/*"><br>
+<small id="ms"></small></fieldset>
+
+<fieldset><legend>Step 2: Remove</legend>
+<input id="inp" type="file" accept="image/*,video/*"><br>
+<button id="go">Process</button> <small id="st"></small><br>
+<canvas id="out"></canvas>
+<video id="vid" playsinline style="display:none"></video></fieldset>
+
+<script>
+const $=id=>document.getElementById(id);
+let mask=null;
+const key=()=>'wm_'+$('kind').value;
+function loadMask(){
+  try{mask=JSON.parse(localStorage.getItem(key()))}catch(e){mask=null}
+  $('ms').textContent=mask?`Mask ready: ${mask.w}x${mask.h}px (source ${mask.W}x${mask.H})`:'Mask nahi hai';
+}
+$('kind').onchange=loadMask; loadMask();
+
+async function toSrc(f){
+  if(f.type.startsWith('video')){
+    const v=document.createElement('video');
+    v.src=URL.createObjectURL(f);v.muted=true;
+    await new Promise(r=>v.onloadeddata=r);
+    v.currentTime=Math.min(1,v.duration/2);
+    await new Promise(r=>v.onseeked=r);
+    return{el:v,w:v.videoWidth,h:v.videoHeight};
+  }
+  const b=await createImageBitmap(f);
+  return{el:b,w:b.width,h:b.height};
+}
+
+$('cal').onchange=async e=>{
+  const f=e.target.files[0]; if(!f)return;
+  const s=await toSrc(f);
+  const c=document.createElement('canvas');c.width=s.w;c.height=s.h;
+  const x=c.getContext('2d',{willReadFrequently:true});x.drawImage(s.el,0,0);
+  const R=Math.min(+$('reg').value,s.w,s.h);
+  const d=x.getImageData(s.w-R,s.h-R,R,R).data;
+  let x0=R,y0=R,x1=-1,y1=-1;const a=new Float32Array(R*R);
+  for(let i=0;i<R*R;i++){
+    const l=(d[i*4]+d[i*4+1]+d[i*4+2])/765;a[i]=l;
+    if(l>0.03){const px=i%R,py=(i/R)|0;
+      x0=Math.min(x0,px);x1=Math.max(x1,px);y0=Math.min(y0,py);y1=Math.max(y1,py);}
+  }
+  if(x1<0){alert('Watermark nahi mila. Pure black image/frame do.');return}
+  const arr=[];
+  for(let y=y0;y<=y1;y++)for(let xx=x0;xx<=x1;xx++)arr.push(+a[y*R+xx].toFixed(3));
+  mask={w:x1-x0+1,h:y1-y0+1,mx:R-1-x1,my:R-1-y1,W:s.w,H:s.h,a:arr};
+  localStorage.setItem(key(),JSON.stringify(mask));loadMask();
+};
+
+// B = (C - W*alpha) / (1 - alpha), W = white (255)
+function fix(ctx,W,H){
+  const s=W/mask.W,tw=Math.round(mask.w*s),th=Math.round(mask.h*s);
+  const x0=W-Math.round(mask.mx*s)-tw,y0=H-Math.round(mask.my*s)-th;
+  const im=ctx.getImageData(x0,y0,tw,th),d=im.data;
+  for(let j=0;j<th;j++)for(let i=0;i<tw;i++){
+    const al=mask.a[Math.min(mask.h-1,(j/s)|0)*mask.w+Math.min(mask.w-1,(i/s)|0)];
+    if(al<0.01||al>0.97)continue;
+    const p=(j*tw+i)*4;
+    for(let c=0;c<3;c++)d[p+c]=Math.max(0,Math.min(255,(d[p+c]-255*al)/(1-al)));
+  }
+  ctx.putImageData(im,x0,y0);
+}
+
+function dl(blob,name){
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();
+}
+
+async function doImg(f){
+  const b=await createImageBitmap(f),c=$('out');
+  c.width=b.width;c.height=b.height;
+  const x=c.getContext('2d',{willReadFrequently:true});
+  x.drawImage(b,0,0);fix(x,b.width,b.height);
+  c.toBlob(bl=>dl(bl,'clean.png'),'image/png');
+  $('st').textContent='Done (PNG download hua)';
+}
+
+async function doVid(f){
+  const v=$('vid');v.src=URL.createObjectURL(f);
+  await new Promise(r=>v.onloadedmetadata=r);
+  const W=v.videoWidth,H=v.videoHeight;
+  // main canvas stays GPU-accelerated (no willReadFrequently) -> smooth
+  const c=document.createElement('canvas');c.width=W;c.height=H;
+  const x=c.getContext('2d',{alpha:false});
+  // only the small watermark patch is read/processed per frame
+  const s=W/mask.W,tw=Math.round(mask.w*s),th=Math.round(mask.h*s);
+  const x0=W-Math.round(mask.mx*s)-tw,y0=H-Math.round(mask.my*s)-th;
+  const pc=document.createElement('canvas');pc.width=tw;pc.height=th;
+  const px=pc.getContext('2d',{willReadFrequently:true});
+  const al=new Float32Array(tw*th);
+  for(let j=0;j<th;j++)for(let i=0;i<tw;i++){
+    const a=mask.a[Math.min(mask.h-1,(j/s)|0)*mask.w+Math.min(mask.w-1,(i/s)|0)];
+    al[j*tw+i]=(a<0.01||a>0.97)?0:a;
+  }
+  const st=c.captureStream(0),vt=st.getVideoTracks()[0];
+  try{v.captureStream().getAudioTracks().forEach(t=>st.addTrack(t));}catch(e){}
+  const mt=['video/mp4;codecs=avc1,mp4a.40.2','video/webm;codecs=vp9,opus','video/webm'].find(t=>MediaRecorder.isTypeSupported(t));
+  const ext=mt.startsWith('video/mp4')?'mp4':'webm';
+  const rec=new MediaRecorder(st,{mimeType:mt,videoBitsPerSecond:12e6}),ch=[];
+  rec.ondataavailable=e=>ch.push(e.data);
+  rec.onstop=()=>{dl(new Blob(ch,{type:mt.split(';')[0]}),'clean.'+ext);$('st').textContent='Done ('+ext.toUpperCase()+' download hua)'};
+  const draw=()=>{
+    x.drawImage(v,0,0,W,H);
+    px.drawImage(v,x0,y0,tw,th,0,0,tw,th);
+    const im=px.getImageData(0,0,tw,th),d=im.data;
+    for(let k=0;k<al.length;k++){
+      const a=al[k];if(!a)continue;const p=k*4,inv=1/(1-a),w=255*a;
+      d[p]=(d[p]-w)*inv;d[p+1]=(d[p+1]-w)*inv;d[p+2]=(d[p+2]-w)*inv;
+    }
+    px.putImageData(im,0,0);
+    x.drawImage(pc,x0,y0);
+    if(vt.requestFrame)vt.requestFrame(); // push exactly one frame per source frame
+    $('st').textContent=`Processing ${Math.round(v.currentTime/v.duration*100)}%`;
+    if(!v.ended){v.requestVideoFrameCallback?v.requestVideoFrameCallback(draw):requestAnimationFrame(draw)}
+  };
+  v.onended=()=>setTimeout(()=>rec.stop(),300);
+  rec.start();await v.play();draw();
+}
+
+$('go').onclick=async()=>{
+  const f=$('inp').files[0];
+  if(!f)return alert('File choose karo');
+  if(!mask)return alert('Pehle calibration karo');
+  $('st').textContent='Processing...';
+  f.type.startsWith('video')?doVid(f):doImg(f);
+};
+</script></body></html>
